@@ -19,7 +19,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
+import threading
 from absl import logging
+
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.distribute import multi_worker_test_base
 from tensorflow.python.distribute import sharded_variable
@@ -40,6 +43,48 @@ from tensorflow.python.ops import variables
 from tensorflow.python.training.server_lib import ClusterSpec
 
 
+class ErrorReportingThread(threading.Thread):
+
+  error = None
+
+  def __init__(self, *args, **kwargs):
+    assert "target" in kwargs
+    target = kwargs["target"]
+
+    @functools.wraps(target)
+    def wrapped_target(*args, **kwargs):
+      try:
+        return target(*args, **kwargs)
+      except Exception as e:  # pylint: disable=broad-except
+        ErrorReportingThread.error = e
+
+    kwargs["target"] = wrapped_target
+    super(ErrorReportingThread, self).__init__(*args, **kwargs)
+
+
+class TestCaseWithErrorReportingThread(test.TestCase):
+
+  @classmethod
+  def setUpClass(cls):
+    cls._threading_thread = threading.Thread
+    threading.Thread = ErrorReportingThread
+    super(TestCaseWithErrorReportingThread, cls).setUpClass()
+
+  @classmethod
+  def tearDownClass(cls):
+    super(TestCaseWithErrorReportingThread, cls).tearDownClass()
+    threading.Thread = cls._threading_thread
+
+  def setUp(self):
+    ErrorReportingThread.error = None
+    super(TestCaseWithErrorReportingThread, self).setUp()
+
+  def tearDown(self):
+    super(TestCaseWithErrorReportingThread, self).tearDown()
+    if ErrorReportingThread.error:
+      raise ErrorReportingThread.error  # pylint: disable=raising-bad-type
+
+
 def make_client(num_workers, num_ps):
   # TODO(rchao): Test the internal rpc_layer version.
   cluster_def = multi_worker_test_base.create_in_process_cluster(
@@ -52,7 +97,7 @@ def make_client(num_workers, num_ps):
   return parameter_server_client.ParameterServerClient(cluster_resolver)
 
 
-class ParameterServerClientTest(test.TestCase):
+class ParameterServerClientTest(TestCaseWithErrorReportingThread):
 
   @classmethod
   def setUpClass(cls):
@@ -304,7 +349,7 @@ class VariablePartitioningScopeTest(test.TestCase):
     self.assertEqual(var_sum, 10.0)
 
 
-class ErrorReportingTest(test.TestCase):
+class ErrorReportingTest(TestCaseWithErrorReportingThread):
 
   @classmethod
   def setUpClass(cls):
@@ -329,6 +374,15 @@ class ErrorReportingTest(test.TestCase):
     self.iteration.assign_add(1.0)
     return self.iteration
 
+  @def_function.function
+  def _long_function(self):
+    x = random_ops.random_uniform((1000, 1000))
+    for _ in math_ops.range(10000):
+      a = random_ops.random_uniform((1000, 1000))
+      b = random_ops.random_uniform((1000, 1000))
+      x += math_ops.matmul(a, b)
+    return x
+
   def testJoinRaiseError(self):
     for _ in range(3):
       self.client.schedule(self._normal_function)
@@ -344,8 +398,16 @@ class ErrorReportingTest(test.TestCase):
       while True:
         self.client.schedule(self._normal_function)
 
+  def testScheduleRaiseErrorWithMultipleFailure(self):
+    for _ in range(3):
+      self.client.schedule(self._normal_function)
+    self.client.schedule(self._error_function)
+    with self.assertRaises(errors.InvalidArgumentError):
+      while True:
+        self.client.schedule(self._error_function)
+    self.client.join()
+
   def testErrorWillbeCleared(self):
-    self.skipTest("b/157597579")
     self.client.schedule(self._error_function)
     with self.assertRaises(errors.InvalidArgumentError):
       self.client.join()
@@ -356,7 +418,7 @@ class ErrorReportingTest(test.TestCase):
     with self.assertRaises(errors.InvalidArgumentError):
       self.client.join()
 
-  def testFutureReturnError(self):
+  def testRemoteValueReturnError(self):
     result = self.client.schedule(self._error_function)
 
     with self.assertRaises(errors.InvalidArgumentError):
@@ -382,6 +444,22 @@ class ErrorReportingTest(test.TestCase):
 
     with self.assertRaises(client.InputError):
       self.client.join()
+
+  def testCancellation(self):
+    for _ in range(3):
+      self.client.schedule(self._normal_function)
+    long_function = self.client.schedule(self._long_function)
+    self.client.schedule(self._error_function)
+
+    with self.assertRaises(errors.InvalidArgumentError):
+      self.client.join()
+
+    with self.assertRaises(client.FunctionRetryableError):
+      long_function.fetch()
+
+    for _ in range(3):
+      self.client.schedule(self._normal_function)
+    self.client.join()
 
 
 class LimitedClosureQueueErrorTest(ErrorReportingTest):

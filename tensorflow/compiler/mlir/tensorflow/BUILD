@@ -333,6 +333,7 @@ cc_library(
     deps = [
         ":tensorflow_types",
         "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:SideEffects",
         "@llvm-project//mlir:Support",
     ],
 )
@@ -675,6 +676,7 @@ cc_library(
 cc_library(
     name = "tf_saved_model_passes",
     srcs = [
+        "transforms/deduplicate_bound_input_bindings.cc",
         "transforms/freeze_global_tensors.cc",
         "transforms/lift_variables_pass.cc",
         "transforms/optimize_global_tensors.cc",
@@ -703,6 +705,31 @@ cc_library(
 )
 
 cc_library(
+    name = "tensorflow_analysis",
+    srcs = [
+        "analysis/per_function_aggregate_analysis.h",
+        "analysis/resource_alias_analysis.cc",
+        "analysis/side_effect_analysis.cc",
+    ],
+    hdrs = [
+        "analysis/resource_alias_analysis.h",
+        "analysis/side_effect_analysis.h",
+    ],
+    deps = [
+        ":tensorflow",
+        ":tensorflow_types",
+        "//tensorflow/compiler/tf2xla:resource_operation_table",
+        "//tensorflow/core:framework",
+        "@com_google_absl//absl/strings",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:Analysis",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
     name = "tensorflow_passes",
     srcs = [
         "transforms/annotate_parameter_replication.cc",
@@ -727,6 +754,7 @@ cc_library(
         "transforms/generated_optimize.inc",
         "transforms/gpu_fusion.cc",
         "transforms/graph_pruning.cc",
+        "transforms/guarantee_all_funcs_one_use.cc",
         "transforms/init_text_file_to_import.cc",
         "transforms/launch_to_device_attribute.cc",
         "transforms/layout_optimization.cc",
@@ -748,9 +776,10 @@ cc_library(
         "transforms/sink_constant.cc",
         "transforms/stack_ops_decomposition.cc",
         "transforms/tensor_array_ops_decomposition.cc",
-        "transforms/tensor_device_copy_conversion.cc",
         "transforms/tensor_list_ops_decomposition.cc",
+        "transforms/test_resource_alias_analysis.cc",
         "transforms/test_side_effect_analysis.cc",
+        "transforms/test_visitor_util.cc",
         "transforms/tf_data_optimization_pass.cc",
         "transforms/tf_device_assignment.cc",
         "transforms/tpu_cluster_formation.cc",
@@ -759,6 +788,7 @@ cc_library(
         "transforms/tpu_extract_head_tail_outside_compilation.cc",
         "transforms/tpu_extract_outside_compilation.cc",
         "transforms/tpu_host_computation_expansion.cc",
+        "transforms/tpu_identity_pruning.cc",
         "transforms/tpu_merge_variables_with_execute.cc",
         "transforms/tpu_outside_compilation_cluster.cc",
         "transforms/tpu_rewrite_pass.cc",
@@ -790,17 +820,20 @@ cc_library(
         ":error_util",
         ":export_tf_dialect_op",
         ":mangling_util",
-        ":side_effect_analysis",
         ":tensorflow",
+        ":tensorflow_analysis",
         ":tensorflow_optimize_inc_gen",
         ":tensorflow_types",
         ":tf_data_optimization",
         ":tpu_rewrite_device_util",
         ":translate_utils",
         ":unroll_batch_matmul_pass",
+        ":visitor_util",
         ":xla_sharding_util",
         "//tensorflow/compiler/mlir:op_or_arg_name_mapper",
         "//tensorflow/compiler/mlir/lite:validators",
+        "//tensorflow/compiler/mlir/xla:xla_legalize_tf",
+        "//tensorflow/compiler/mlir/xla:xla_legalize_tf_with_tf2xla",
         "//tensorflow/compiler/xla:xla_data_proto_cc",
         "//tensorflow/compiler/xla:xla_proto_cc",
         "//tensorflow/compiler/xla/client:sharding_builder",
@@ -1238,7 +1271,7 @@ cc_library(
     name = "tf_dialect_passes",
     srcs = [
         "transforms/constant_fold.cc",
-        "transforms/dialect_hooks.cc",
+        "transforms/decode_attributes_hook.cc",
     ],
     hdrs = [
         "transforms/constant_fold.h",
@@ -1601,6 +1634,7 @@ cc_library(
     deps = [
         ":lower_tf_inc_gen",
         ":tensorflow",
+        ":tensorflow_ops",
         ":tensorflow_types",
         "//tensorflow/core:framework",
         "@llvm-project//llvm:Support",
@@ -1653,6 +1687,7 @@ cc_library(
         ":tensorflow",
         "//tensorflow/core:core_cpu_lib",
         "//tensorflow/core:framework",
+        "@com_google_absl//absl/strings",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Support",
@@ -1756,18 +1791,16 @@ cc_library(
 )
 
 cc_library(
-    name = "side_effect_analysis",
-    srcs = ["analysis/side_effect_analysis.cc"],
-    hdrs = ["analysis/side_effect_analysis.h"],
+    name = "visitor_util",
+    srcs = [
+        "utils/visitor_util.cc",
+    ],
+    hdrs = [
+        "utils/visitor_util.h",
+    ],
     deps = [
-        ":tensorflow",
-        ":tensorflow_types",
-        "//tensorflow/compiler/tf2xla:resource_operation_table",
-        "//tensorflow/core:framework",
-        "@com_google_absl//absl/strings",
         "@llvm-project//llvm:Support",
         "@llvm-project//mlir:IR",
-        "@llvm-project//mlir:Pass",
         "@llvm-project//mlir:Support",
     ],
 )

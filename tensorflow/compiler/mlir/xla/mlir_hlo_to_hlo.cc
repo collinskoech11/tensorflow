@@ -882,6 +882,17 @@ LogicalResult ExportXlaOp(ReturnOp op, OpLoweringContext ctx) {
   return failure();
 }
 
+LogicalResult ExportXlaOp(RngBitGeneratorOp op, OpLoweringContext ctx) {
+  auto& value_map = *ctx.values;
+  auto result = op.getResult();
+  auto xla_arg_1 = value_map[*op.getODSOperands(0).begin()];
+  auto xla_result = xla::RngBitGenerator(
+      static_cast<xla::RandomAlgorithm>(op.rng_algorithm().getSExtValue()),
+      Unwrap(xla_arg_1), xla::TypeToShape(result.getType()).tuple_shapes(1));
+  value_map[result] = xla_result;
+  return mlir::success();
+}
+
 LogicalResult ExportXlaOp(RngNormalOp op, OpLoweringContext ctx) {
   auto& value_map = *ctx.values;
   xla::XlaOp mu, sigma;
@@ -1009,8 +1020,32 @@ LogicalResult ExportXlaOp(WhileOp op, OpLoweringContext ctx) {
 }
 
 LogicalResult ExportXlaOp(FusionOp op, OpLoweringContext ctx) {
-  // TODO(whoever): currently not supported.
-  return failure();
+  if (!op.fusion_kind()) {
+    op.emitOpError() << "requires fusion kind for HLO translation";
+    return failure();
+  }
+
+  xla::XlaComputation fused_computation;
+  if (failed(ctx.converter->LowerRegionAsComputation(&op.fused_computation(),
+                                                     &fused_computation)))
+    return failure();
+
+  auto& values = *ctx.values;
+  llvm::SmallVector<xla::XlaOp, 4> operands;
+  for (auto operand : op.operands()) operands.push_back(values[operand]);
+
+  xla::XlaOp fusion = xla::internal::XlaBuilderBuildFusion(
+      ctx.builder, operands,
+      absl::string_view(op.fusion_kind()->data(), op.fusion_kind()->size()),
+      fused_computation);
+  if (op.getNumResults() == 1) {
+    values[op.getResult(0)] = fusion;
+  } else {
+    for (auto item : llvm::enumerate(op.getResults())) {
+      values[item.value()] = xla::GetTupleElement(fusion, item.index());
+    }
+  }
+  return success();
 }
 
 }  // namespace
@@ -1581,6 +1616,16 @@ LogicalResult AddDynamicParameterBindings(mlir::ModuleOp module,
 }
 
 }  // namespace
+
+Status ConvertRegionToComputation(mlir::Region* region,
+                                  xla::XlaComputation* func) {
+  mlir::ModuleOp module;
+  ConvertToHloModule converter(module, true, true, {});
+  if (failed(converter.LowerRegionAsComputation(region, func)))
+    return tensorflow::errors::Internal(
+        "failed to convert region to computation");
+  return Status::OK();
+}
 
 Status ConvertMlirHloToHlo(mlir::ModuleOp module, xla::HloProto* hlo_proto,
                            bool use_tuple_args, bool return_tuple,
